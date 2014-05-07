@@ -1,0 +1,313 @@
+#!/usr/bin/env python
+
+## This code was modified from the aligner available at 
+## https://github.com/callison-burch/dreamt.git
+
+import argparse
+import sys
+import os
+import time
+from collections import defaultdict
+from collections import namedtuple
+from collections import Counter
+import string
+import math
+
+parser = argparse.ArgumentParser()
+parser.add_argument('dir', help='Directory containing files')
+parser.add_argument('-t', '--type', dest='type', default='train', choices=['train', 'test'], help='Should the features be generated for train or test set?')
+parser.add_argument('-o', '--features', dest='features', default='_features', help='File which to write features to.')
+parser.add_argument('-E', '--english_aligned', dest='english_aligned', default='europarl_e', help='File containing aligned English sentences.')
+parser.add_argument('-F', '--foreign_aligned', dest='foreign_aligned', default='europarl_f', help='File containing aligned foreign sentences.')
+parser.add_argument('-e', '--english', dest='english', default='_e', help='File containing English articles.')
+parser.add_argument('-f', '--foreign', dest='foreign', default='_f', help='File containing Foreign articles.')
+parser.add_argument('-b', '--bilingual', dest='bilingual', default='bilingual', help='english|foreign bilingual dictionary.')
+parser.add_argument('-d', '--direction', dest='direction', type=int, default=0, help='Direction. If not 0, we align English > Foreign instead.')
+parser.add_argument('-i', '--ibm1', dest='ibm_iter', type=int, default=5, help='Number of times to run IBM1.')
+parser.add_argument('-k', '--hmm', dest='hmm_iter', type=int, default=5, help='Number of times to run HMM.')
+parser.add_argument('-n', '--num_sents', dest='num_sents', type=int, default=2000, help='Number of sentences of input data to use.')
+parser.add_argument('-a', '--alignments', dest='alignments', default='_a', help='File containing alignments for each article.')
+args = parser.parse_args()
+
+e_vocab = []
+f_vocab = []
+for line in open(args.dir + '/' + args.bilingual):
+  parts = line.strip().split('|')
+  if args.direction == 0:
+    e_vocab.append(parts[0])
+    f_vocab.append(parts[1])
+  else:
+    e_vocab.append(parts[1])
+    f_vocab.append(parts[0])
+  
+
+if args.direction == 0:
+  e_file = args.dir + '/' + args.english_aligned
+  f_file = args.dir + '/' + args.foreign_aligned
+else:
+  e_file = args.dir + '/' + args.foreign_aligned
+  f_file = args.dir + '/' + args.english_aligned
+
+
+def ibm1():
+  # set up pairs of sentences, with NULL inserted in foreign language
+  pairs = [[[None] + [word for word in pair[0].strip().split()], 
+            [word for word in pair[1].strip().split()]] 
+           for pair in zip(open(f_file), open(e_file))[:args.num_sents]]
+  pairs = [pair for pair in pairs if len(pair[0]) > 0 and len(pair[1]) > 0]
+  vocab = [[[None] + [word for word in pair[0].strip().split()], 
+            [word for word in pair[1].strip().split()]] 
+           for pair in zip(f_vocab, e_vocab)]
+  all_pairs = pairs + vocab
+  ## setting up initial values
+  t = defaultdict(int)
+  total = defaultdict(int)
+  for pair in all_pairs:
+    for w1 in pair[1]:
+      for w0 in pair[0]:
+        total[w1] += 1
+        t[(w1, w0)] += 1
+  for (w1, w0) in t.keys():
+    t[(w1, w0)] = float(t[(w1, w0)]) / total[w1]
+  ## Loop through iterations
+  for i in range(args.ibm_iter):
+    sys.stderr.write("Now doing iteration %i for ibm1\n" % (i + 1))
+    count = defaultdict(float)
+    total = defaultdict(float)
+    for pair in all_pairs:
+      for w1 in pair[1]:
+        denom = sum(t[(w1, w0)] for w0 in pair[0])
+        for w0 in pair[0]:
+          count[(w1, w0)] += t[(w1, w0)] / denom
+          total[w0] += t[(w1, w0)] / denom
+    for (w1, w0) in t.keys(): 
+      t[(w1, w0)] = count[(w1, w0)] / total[w0] 
+  # don't return vocab we want full sentences for HMM
+  return (t, pairs)
+
+# Run the IBM Model 1
+(t, pairs) = ibm1()
+
+# Append a path (alignment) to every pair of sentences
+for pair in pairs:
+  pair.append([0 for _ in pair[1]])
+  pair.append(0.0)
+
+max_f_len = max(len(pair[0]) for pair in pairs) 
+max_e_len = max(len(pair[1]) for pair in pairs)
+
+K = 200
+
+# Instantiate all the necessary arguments
+#s = [0.2 for _ in range(2*max_f_len - 1)]
+#pi = [0.1 for _ in range(max_f_len)]
+s = [0.0 for _ in range(K)]
+pi = [0.0 for _ in range(K)]
+for i in range(1, max_f_len):
+  s[i] = 1.0 / i
+  s[-i] = 0.5 / i
+  pi[i] = 1.0 / i
+s = [s_i / sum(s) for s_i in s]
+pi = [pi_i / sum(pi) for pi_i in pi]
+p_null = 0.01
+
+def update_params():
+#  pi_count = [0 for _ in range(max_f_len)]        # initial probs
+#  s_count = [0 for _ in range(2*max_f_len - 1)]   # transition probabilities
+  pi_count = [1 for _ in range(K)]        # initial probs
+  s_count = [1 for _ in range(K)]         # transition probabilities
+  null_count = 0                                  # English words not from foreign words
+  for pair in pairs:
+    path = pair[2]                                    # Current path, as determined by Viterbi algorithm
+    if path[0] != 0: pi_count[path[0]] += 1           # initial prob count increased by first position in path; we never treat NULL as the start
+    for i in range(1, len(path)):
+      prev = i - 1                        
+      if path[i] == 0: null_count += 1                         # if the English word came from NULL, increase null-count
+      while path[prev] == 0 and prev > 0: prev -= 1            # if the previous word is NULL, look for the word before that; stop when you reach zero
+      if path[prev] != 0: s_count[path[i] - path[prev]] += 1   # we have now jumped the distance from the last word to this one; don't count jumps from 0
+      else: pi_count[path[i]] += 1                             # we never treat NULL as the start of a sentence
+  # normalize params
+  p_null = null_count / float(sum(s_count) + null_count)
+  s = [s_i / float(sum(s_count)) for s_i in s_count]
+  pi = [pi_i / float(sum(pi_count)) for pi_i in pi_count]
+  return (p_null, s, pi)
+
+def viterbi():
+  for (pairnum, pair) in enumerate(pairs):
+    if pairnum % 100 == 0: sys.stderr.write("Done %i pairs of %i...\n" % (pairnum, len(pairs)))
+    # length of sequence; equal to length of English sentence
+    time = range(len(pair[1]))
+    # number of possible states; equal to length of foreign sentence
+    states = range(len(pair[0]))
+    s_denom = [sum(s[j - k] for j in states) for k in states]
+    not_p_null = 1 - p_null
+    delta = [[0.0 for _ in states] for _ in time]
+    gamma = [[0 for _ in states] for _ in time]
+    # delta 0 corresponds to the start state (time 0); probability of starting for every French word
+    #############delta[0][0] = p_null # Make a special provision for NULL at the beginning of a sentence
+    delta[0][0] = math.log(p_null) # Make a special provision for NULL at the beginning of a sentence
+    for st in states[1:]:
+      ### Heuristic: if the word appears exactly in both sentences, it should not be translated from another word
+      ####################################################
+      if pair[1][0] in pair[0] and pair[0][st] != pair[1][0]: t_prob = 0.0
+      elif pair[0][st] == pair[1][0]: t_prob = 1.0
+      else: t_prob = t[(pair[1][0], pair[0][st])]
+#       elif st == 0:
+#         if (pair[1][0], pair[0][st]) in t.keys(): t_prob = t[(pair[1][0], pair[0][st])]
+#         else: t_prob = 1.0
+#       else:
+#         if (pair[1][0], pair[0][st]) in t.keys(): t_prob = t[(pair[1][0], pair[0][st])]
+#         else: t_prob = 0.0
+      ####################################################
+      ############delta[0][st] = t_prob * pi[st]
+      t_pi = t_prob * pi[st]
+      if t_pi == 0: delta[0][st] = -1 * sys.maxint
+      else: delta[0][st] = math.log(t_pi)
+    # now we step through the rest of the time period using dynamic programming
+    for ti in time[1:]:
+      for curr_state in states:
+        ###############max_val = -1 # the maximum probability (of states from which this one could have come)
+        max_val = -1 * sys.maxint # the maximum probability (of states from which this one could have come)
+        max_ind = -1 # the maximum likely state from which this one came
+        for prev_state in states:
+          prev_delta = delta[ti - 1][prev_state]    # The likelihood of the most likely path to the previous state
+          if curr_state == 0: trans_prob = p_null   # If we're drawing from NULL, we should use p_null
+          else:                                     # Otherwise, step back and look for the first non-null state in the chain
+            prev_prev = prev_state
+            prev_time = ti - 1
+            while prev_prev == 0 and prev_time > 0:
+              prev_prev -= gamma[prev_time][prev_prev] # step one state back along the chain
+              prev_time -= 1                           # we're going back in time
+            if prev_prev > 0: trans_prob = not_p_null * s[curr_state - prev_prev] / s_denom[prev_prev]
+            else: trans_prob = pi[curr_state]          # Once again, if it's all NULL up to here then we just say we started here
+          ###################prod = prev_delta * trans_prob
+          #prod = prev_delta + math.log(trans_prob)
+          if trans_prob == 0: prod = -1 * sys.maxint
+          else: prod = prev_delta + math.log(trans_prob)
+          if prod > max_val:
+            max_val = prod
+            max_ind = prev_state
+        ### Heuristic: if the word appears exactly in both sentences, it should not be translated from another word
+        ####################################################
+        if pair[1][ti] in pair[0] and pair[0][curr_state] != pair[1][ti]: t_prob = 0.0
+        elif pair[0][curr_state] == pair[1][ti]: t_prob = 1.0
+        else: t_prob = t[(pair[1][ti], pair[0][curr_state])]
+#         elif curr_state == 0:
+#           if (pair[1][ti], pair[0][curr_state]) in t.keys(): t_prob = t[(pair[1][ti], pair[0][curr_state])]
+#           else: t_prob = 1.0
+#         else:
+#           if (pair[1][ti], pair[0][curr_state]) in t.keys(): t_prob = t[(pair[1][ti], pair[0][curr_state])]
+#           else: t_prob = 0.0
+        #####################################################
+        ############delta[ti][curr_state] = t_prob * max_val
+        if t_prob == 0.0: delta[ti][curr_state] = -1 * sys.maxint
+        else: delta[ti][curr_state] = math.log(t_prob) + max_val
+        gamma[ti][curr_state] = max_ind
+    # start building the path, back to front
+    ############max_val = -1
+    max_val = -1 * sys.maxint
+    for (i, val) in enumerate(delta[-1]):
+      if val > max_val:
+        max_val = val
+        pair[2][-1] = i
+    pair[3] = max_val
+    for i in reversed(time[:-1]):
+      pair[2][i] = gamma[i + 1][pair[2][i+1]]
+
+for i in range(args.hmm_iter):
+  sys.stderr.write("Now doing iteration %i for HMM\n" % (i + 1))
+  viterbi()
+  (p_null, s, pi) = update_params()
+sys.stderr.write("Doing final alignment...\n")
+
+e_file = args.dir + '/' + args.type + args.english
+f_file = args.dir + '/' + args.type + args.foreign
+
+article = namedtuple('article', 'name, lines')
+pair = namedtuple('pair', 'name, f_lines, e_lines')
+
+def article_data(filename):
+    articles = []
+    art = None
+    newflag = True
+    for line in open(filename):
+        if len(line.strip()) == 0: 
+            newflag = True
+            if art != None: articles.append(art)
+        elif newflag:
+            art = article(line.strip(), [])
+            newflag = False
+        else:
+            art[1].append(line.strip().split())
+    articles.append(art)
+    return articles
+
+def combine_articles(a_f, a_e):
+    pairs = []
+    for f,e in zip(a_f, a_e):
+        pairs.append(pair(e[0], f[1], e[1]))
+    return pairs
+
+f_data = article_data(f_file)
+e_data = article_data(e_file)
+
+alignments_file = args.dir + '/' + args.type + args.alignments
+if args.type == 'train': a_data = open(alignments_file)
+else: a_data = ['' for _ in range(len(f_data))]
+
+pairs = []
+
+for (n, (p, a)) in enumerate(zip(combine_articles(f_data, e_data), a_data)):
+  alignments = a.strip().split(', ')
+  for i, f_sent in enumerate(p.f_lines):
+    for j, e_sent in enumerate(p.e_lines):
+      a_string = str(i) + '-' + str(j)
+      aligned = 0
+      if a_string in alignments: aligned = 1
+      if args.direction == 0:
+        pairs.append([[None] + f_sent, e_sent, [0 for _ in e_sent], 0.0, n, a_string, aligned])
+        for w in e_sent:
+          if t[(w, None)] == 0: t[(w, None)] = 1.0
+      else:
+        pairs.append([[None] + e_sent, f_sent, [0 for _ in f_sent], 0.0, n, a_string, aligned])
+        for w in f_sent:
+          if t[(w, None)] == 0: t[(w, None)] = 1.0
+
+viterbi()  
+
+feature_file = args.dir + '/' + args.type + args.features
+
+ptr = open(feature_file, 'w')
+
+for pair in pairs:
+  alignment = pair[2]
+  ratio = float(max(len(pair[0]) - 1, len(pair[1]))) / min(len(pair[0]) - 1, len(pair[1]))
+  score = pair[3] / float(len(pair[1]))
+  aligned = sum(1.0 for a in alignment if a != 0) / float(len(pair[1]))
+  unaligned = sum(1.0 for a in alignment if a == 0) / float(len(pair[1]))
+  (max_a_seq, max_u_seq, a_seq, u_seq) = (0.0, 0.0, 0.0, 0.0)
+  for a in alignment:
+    if a == 0:
+      max_a_seq = max(max_a_seq, a_seq)
+      a_seq = 0
+      u_seq += 1
+    else:
+      max_u_seq = max(max_u_seq, u_seq)
+      u_seq = 0
+      a_seq += 1
+  max_a_seq = max(max_a_seq, a_seq) / float(len(pair[1]))
+  max_u_seq = max(max_u_seq, u_seq) / float(len(pair[1]))
+  fertility = Counter([a for a in alignment if a!=0])
+  fert_1 = sum(1.0 for f in fertility if f == 1) / float(len(pair[1]))
+  fert_2 = sum(1.0 for f in fertility if f == 2) / float(len(pair[1]))
+  fert_3 = sum(1.0 for f in fertility if f > 2) / float(len(pair[1]))
+
+  feats = (ratio, score, aligned, unaligned, max_a_seq, max_u_seq, fert_1, fert_2, fert_3)
+  feats_str = '\t'.join([str(round(x, 3)) for x in feats])
+  
+#  ptr.write('\t'.join([str(pair[4]), pair[5], 
+#                       str(round(math.log(pair[3]) / len(pair[1]), 3))]) + '\n')
+  ptr.write('\t'.join([str(pair[4]), pair[5], str(pair[6]), feats_str]) + '\n')
+  
+ptr.close()
+

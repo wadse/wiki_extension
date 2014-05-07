@@ -1,0 +1,21 @@
+#!/usr/bin/env python
+
+import argparse
+
+parser = argparse.ArgumentParser()
+parser.add_argument('f1', help='First feature file (not reversed)')
+parser.add_argument('f2', help='Second feature file (reversed)')
+parser.add_argument('out', help='File to write output to')
+args = parser.parse_args()
+
+ptr = open(args.out, 'w')
+for a_line, b_line in zip(open(args.f1), open(args.f2)):
+    a = a_line.split()
+    b = b_line.split()
+    b_feat = b[4:]
+    all = a + b_feat
+    ptr.write('\t'.join(all) + '\n')
+ptr.close()
+    
+    
+    

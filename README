@@ -1,0 +1,11 @@
+The extended system is the base system with the following modifications:
+
+ - Used HMM alignments instead of IBM1 alignments
+ - Added bilingual dictionary information from Wiktionary
+
+-t paramater for the align script was (by langauge):
+   bg = 0.3
+   de = 0.4
+   es = 0.5
+
+A threshold of 0.3, for example, means that the lowest scoring 30% of alignments were dropped.

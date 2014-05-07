@@ -1,0 +1,39 @@
+#!/usr/bin/env python
+
+import argparse
+import sys
+import math
+from collections import namedtuple
+from collections import defaultdict
+
+parser = argparse.ArgumentParser()
+parser.add_argument('dir', help='Directory containing files')
+parser.add_argument('-b', '--features', dest='titles', default='titles', help='File which to write titles to.')
+parser.add_argument('-e', '--english', dest='english', default='traintest_e', help='File containing English articles.')
+parser.add_argument('-f', '--foreign', dest='foreign', default='traintest_f', help='File containing Foreign articles.')
+args = parser.parse_args()
+
+# Files with wikipedia entries and hand alignments
+e_file = args.dir + '/' + args.english
+f_file = args.dir + '/' + args.foreign
+titles_file = args.dir + '/' + args.titles
+
+def title_data(filename):
+    titles = []
+    art = None
+    newflag = True
+    for line in open(filename):
+        if len(line.strip()) == 0: 
+            newflag = True
+        elif newflag:
+            titles.append(line.strip())
+            newflag = False
+    return titles
+
+e_titles = title_data(e_file)
+f_titles = title_data(f_file)
+
+ptr = open(titles_file, 'w')
+for e, f in zip(e_titles, f_titles):
+    ptr.write(e + '|' + f + '\n')
+ptr.close()
